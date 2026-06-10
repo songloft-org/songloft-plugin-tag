@@ -294,7 +294,7 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * 清除歌曲中已嵌入的封面（解决老版本 base64 损坏封面无法覆盖的问题）
- * 传全部标签字段 + cover_url="" 强制 Go 后端重写，绕过 tagsUnchanged 检测
+ * 传全部标签字段 + clear_cover=true 显式清空封面
  */
 export async function clearCover(songId: number): Promise<string> {
   try {
@@ -325,13 +325,12 @@ export async function clearCover(songId: number): Promise<string> {
       } catch { /* ignore */ }
     }
 
-    // 传全部字段 + cover_url="" 强制全量重写（绕过 tagsUnchanged）
-    const body: Record<string, string> = {
+    const body: Record<string, string | boolean> = {
       title: song.title || '',
       artist: song.artist || '',
       album: song.album || '',
       lyrics: lyrics,
-      cover_url: '',
+      clear_cover: true,
     };
 
     const resp = await fetch(`${hostUrl}/api/v1/songs/${songId}/tags`, {
