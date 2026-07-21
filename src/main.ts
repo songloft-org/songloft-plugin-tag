@@ -1,11 +1,12 @@
 /// <reference types="@songloft/plugin-sdk" />
-import { jsonResponse, createRouter } from '@songloft/plugin-sdk';
+import { jsonResponse, createRouter, type HTTPRequest, type HTTPResponse } from '@songloft/plugin-sdk';
 import { toSimplified } from './t2s';
-import { scrapeSong, scrapeBatch, doScrape, writeTags, clearCover, type ScrapeResult } from './scraper';
-import { loadConfig, saveConfig, DEFAULT_CONFIG, searchNetease, searchQQMusic, searchKuGou, searchMiGu, searchKuWo, type ScraperConfig, type SearchResult } from './sources';
+import { scrapeSong, doScrape, writeTags, clearCover, ensureBackup, type ScrapeResult } from './scraper';
+import { loadConfig, saveConfig, DEFAULT_CONFIG, searchNetease, searchQQMusic, searchKuGou, searchMiGu, searchKuWo, extractCandidates, type ScraperConfig, type SearchResult } from './sources';
 import { scoreMatch } from './scoring';
 import { rateLimitWait } from './ratelimit';
 import { circuitStatus, circuitReset } from './circuit';
+import { cacheCount, cacheClear, cacheCleanup } from './cache';
 import { createSemaphore } from './semaphore';
 
 const router = createRouter();
@@ -38,22 +39,46 @@ const batchTasks = new Map<string, {
 }>();
 
 // 已成功刮削的歌曲 ID 集合
+// 内存缓存 + promise 链串行写：并发标记不丢（原先读改写竞态），也省掉每首歌一次全量读
+let scrapedDoneCache: Set<number> | null = null;
+let scrapedWriteChain: Promise<void> = Promise.resolve();
+
 async function getScrapedDone(): Promise<Set<number>> {
+  if (scrapedDoneCache) return scrapedDoneCache;
   try {
     const raw = await songloft.storage.get('scraped_done');
     let arr: number[];
     if (Array.isArray(raw)) { arr = raw; }
     else if (typeof raw === 'string') { arr = JSON.parse(raw); }
     else { arr = []; }
-    return new Set(arr);
-  } catch { return new Set(); }
+    scrapedDoneCache = new Set(arr.map(Number));
+  } catch { scrapedDoneCache = new Set(); }
+  return scrapedDoneCache;
+}
+function persistScrapedDone(): Promise<void> {
+  scrapedWriteChain = scrapedWriteChain.then(async () => {
+    try {
+      if (scrapedDoneCache) await songloft.storage.set('scraped_done', [...scrapedDoneCache]);
+    } catch { /* ok */ }
+  });
+  return scrapedWriteChain;
 }
 async function markScrapedDone(songId: number): Promise<void> {
-  try {
-    const done = await getScrapedDone();
-    done.add(songId);
-    await songloft.storage.set('scraped_done', [...done]);
-  } catch { /* ok */ }
+  const done = await getScrapedDone();
+  done.add(songId);
+  await persistScrapedDone();
+}
+async function removeScrapedDone(songId: number): Promise<void> {
+  const done = await getScrapedDone();
+  done.delete(songId);
+  await persistScrapedDone();
+}
+async function clearScrapedDone(): Promise<void> {
+  scrapedDoneCache = new Set();
+  scrapedWriteChain = scrapedWriteChain.then(async () => {
+    try { await songloft.storage.delete('scraped_done'); } catch { /* ok */ }
+  });
+  await scrapedWriteChain;
 }
 
 // 埋点统计（首次安装/升级记数）
@@ -63,7 +88,7 @@ async function reportStats(): Promise<void> {
     const LAST_VER = 'plugin_stats_last_ver';
     let deviceId = await songloft.storage.get(DEV_ID);
     const lastVer = await songloft.storage.get(LAST_VER);
-    const currentVer = '2.2.0';
+    const currentVer = '2.3.1';
     const isNew = !deviceId;
     const isUpgrade = lastVer && lastVer !== currentVer;
     if (!isNew && !isUpgrade) return;
@@ -90,6 +115,39 @@ function parseBody(req: any): any {
     if (typeof raw === 'object') return raw;
   } catch {}
   return {};
+}
+
+/** 全量歌曲列表（分页拉取，突破单次 10000 上限；保险上限 100 页） */
+async function listAllSongs(): Promise<any[]> {
+  const all: any[] = [];
+  const pageSize = 1000;
+  for (let page = 0; page < 100; page++) {
+    const batch = await songloft.songs.list({ limit: pageSize, offset: page * pageSize });
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return all;
+}
+
+/** 全量本地歌曲 ID（优先宿主文档化端点 GET /songs/ids?type=local；失败回退分页过滤）
+ *  刮削/整理仅支持本地歌曲（宿主 /tags 对非 local 直接 400），网络歌曲进队列只会白耗配额+永久失败 */
+async function listAllSongIds(): Promise<number[]> {
+  try {
+    const token = await songloft.plugin.getToken();
+    const hostUrl = await songloft.plugin.getHostUrl();
+    const resp = await fetch(`${hostUrl}/api/v1/songs/ids?type=local`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const ids = Array.isArray(data) ? data : (data?.ids || data?.data || []);
+      if (Array.isArray(ids) && ids.length > 0) return ids.map(Number).filter(n => Number.isFinite(n));
+    }
+  } catch { /* 回退分页 */ }
+  return (await listAllSongs())
+    .filter(s => ((s as any).type || 'local') === 'local')
+    .map(s => Number(s.id));
 }
 
 // ============================================================
@@ -128,6 +186,16 @@ router.put('/config', async (req) => {
     }
     if (typeof merged.auto_scan_interval === 'number') {
       merged.auto_scan_interval = Math.max(5, Math.min(1440, Math.round(merged.auto_scan_interval)));
+    }
+    // 评分参数范围校验
+    if (typeof merged.score_threshold === 'number') {
+      merged.score_threshold = Math.max(0.5, Math.min(0.9, merged.score_threshold));
+    }
+    if (typeof merged.title_weight === 'number') {
+      merged.title_weight = Math.max(0.2, Math.min(0.8, merged.title_weight));
+    }
+    if (typeof merged.artist_weight === 'number') {
+      merged.artist_weight = Math.max(0.2, Math.min(0.8, merged.artist_weight));
     }
 
     if (merged.netease_api_url && isBadHost(merged.netease_api_url)) {
@@ -277,7 +345,20 @@ router.post('/circuit-breaker/reset', async (req) => {
 });
 
 // ============================================================
-// 目录整理
+// 缓存管理（缓存在插件 storage，非前端 localStorage）
+// ============================================================
+router.get('/cache/stats', async (_req) => {
+  return jsonResponse({ count: await cacheCount() });
+});
+
+router.post('/cache/clear', async (_req) => {
+  const cleared = await cacheClear();
+  songloft.log.info(`[cache] 手动清除 ${cleared} 条缓存`);
+  return jsonResponse({ cleared });
+});
+
+// ============================================================
+// 目录整理（转发宿主文档化端点，body 为裸数组 [{id, target_path}]）
 // ============================================================
 router.post('/organize/preview', async (req) => {
   try {
@@ -287,28 +368,25 @@ router.post('/organize/preview', async (req) => {
       return jsonResponse({ error: '请提供歌曲列表', changes: [] }, 400);
     }
 
-    // 调用主程序 Bridge API
     const token = await songloft.plugin.getToken();
     const hostUrl = await songloft.plugin.getHostUrl();
-    const resp = await fetch(`${hostUrl}/api/v1/jsplugin/tag`, {
+    const resp = await fetch(`${hostUrl}/api/v1/songs/organize/preview`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        action: 'songs.organizePreview',
-        data: { items },
-      }),
+      body: JSON.stringify(items.map((it: any) => ({ id: Number(it.id), target_path: String(it.target_path || '') }))),
     });
 
     if (!resp.ok) {
       const errText = await resp.text();
-      return jsonResponse({ error: errText, changes: [] }, resp.status);
+      return jsonResponse({ error: errText.substring(0, 300), changes: [] }, resp.status);
     }
 
+    // 宿主返回 [{id, old_path, new_path, status: ok|conflict|skip|error, error}]
     const result = await resp.json();
-    return jsonResponse({ changes: result || [] });
+    return jsonResponse({ changes: Array.isArray(result) ? result : [] });
   } catch (e: any) {
     return jsonResponse({ error: e.message || String(e), changes: [] }, 500);
   }
@@ -324,49 +402,84 @@ router.post('/organize/execute', async (req) => {
 
     const token = await songloft.plugin.getToken();
     const hostUrl = await songloft.plugin.getHostUrl();
-    const resp = await fetch(`${hostUrl}/api/v1/jsplugin/tag`, {
+
+    // 执行前记录 old_path（宿主 execute 响应只带 file_path，撤销历史需要原路径）
+    const oldPaths: Record<number, string> = {};
+    for (const it of items) {
+      const id = Number(it.id);
+      try {
+        const song = await songloft.songs.getById(id);
+        oldPaths[id] = (song as any)?.file_path || (song as any)?.filePath || '';
+      } catch { oldPaths[id] = ''; }
+    }
+
+    const resp = await fetch(`${hostUrl}/api/v1/songs/organize`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        action: 'songs.organize',
-        data: { items },
-      }),
+      body: JSON.stringify(items.map((it: any) => ({ id: Number(it.id), target_path: String(it.target_path || '') }))),
     });
 
     if (!resp.ok) {
       const errText = await resp.text();
-      return jsonResponse({ error: errText, results: [] }, resp.status);
+      return jsonResponse({ error: errText.substring(0, 300), results: [] }, resp.status);
     }
 
+    // 宿主返回 [{id, file_path, status, error}]
     const result = await resp.json();
-    const success = (result || []).filter((r: any) => r.status === 'ok').length;
-    const failed = (result || []).filter((r: any) => r.status !== 'ok').length;
-    return jsonResponse({ success, failed, results: result || [] });
+    const arr: any[] = Array.isArray(result) ? result : [];
+    const success = arr.filter((r: any) => r.status === 'ok').length;
+    const failed = arr.length - success;
+
+    // 成功项写入撤销历史（后端持有 old_path，比前端传参可靠）；撤销自身不入史
+    const okItems = body?.skip_history ? [] : arr
+      .filter((r: any) => r.status === 'ok')
+      .map((r: any) => ({ id: r.id, old_path: oldPaths[r.id] || '', new_path: r.file_path || '' }))
+      .filter((r: any) => r.old_path);
+    if (okItems.length > 0) {
+      try {
+        const raw = await songloft.storage.get('org_history');
+        let history: any[] = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? JSON.parse(raw) : []);
+        history.push({ items: okItems, time: Date.now() });
+        if (history.length > 10) history = history.slice(-10);
+        await songloft.storage.set('org_history', history);
+      } catch { /* 历史写入失败不影响整理结果 */ }
+    }
+
+    return jsonResponse({ success, failed, results: arr });
   } catch (e: any) {
     return jsonResponse({ error: e.message || String(e), results: [] }, 500);
   }
 });
 
-// ============================================================
-// 调试：t2s 繁简转换测试
-// ============================================================
-router.get('/test/t2s', async (_req) => {
-  const text = '陳小春 獨家記憶 取消资格';
-  const result = toSimplified(text);
-  return jsonResponse({ input: text, output: result });
+// 整理撤销历史（前端无 songloft 全局，历史必须存后端）
+router.get('/storage/org-history', async (_req) => {
+  try {
+    const raw = await songloft.storage.get('org_history');
+    const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? JSON.parse(raw) : []);
+    return jsonResponse(arr);
+  } catch {
+    return jsonResponse([]);
+  }
 });
-
-
+router.post('/storage/org-history', async (req) => {
+  try {
+    const data = parseBody(req);
+    await songloft.storage.set('org_history', Array.isArray(data) ? data : []);
+    return jsonResponse({ ok: true });
+  } catch (e: any) {
+    return jsonResponse({ error: e.message || String(e) }, 500);
+  }
+});
 
 // ============================================================
 // 刮削
 // ============================================================
 
 // 批量任务执行器（支持并发控制）
-async function runBatchTask(taskId: string, task: any): Promise<void> {
+async function runBatchTask(taskId: string, task: any, opts?: { skipCache?: boolean }): Promise<void> {
   const cfg = await loadConfig();
   const sem = createSemaphore(cfg.max_concurrency || 2);
   const total = task.ids.length;
@@ -382,7 +495,7 @@ async function runBatchTask(taskId: string, task: any): Promise<void> {
         task.skippedIds.push(songId);
         return;
       }
-      const result = await doScrape(songId, cfg);
+      const result = await doScrape(songId, cfg, opts);
       if (!result) {
         songloft.log.info(`[batch] 跳过 songId=${songId}: 无匹配结果`);
         task.skipped++;
@@ -410,12 +523,16 @@ async function runBatchTask(taskId: string, task: any): Promise<void> {
   }));
 
   task.status = 'done';
+  // 批量完成后清理过期缓存
+  cacheCleanup().catch(() => {});
+  // 无论前端是否轮询，10 分钟后清理任务，防内存泄漏
+  setTimeout(() => batchTasks.delete(taskId), 10 * 60 * 1000);
 }
 
 // 批量刮削（异步+轮询，解决超时）
 router.post('/scrape/batch', async (req) => {
   const body = parseBody(req);
-  const ids: number[] = [...new Set(body.ids || [])];
+  const ids: number[] = [...new Set<number>((body.ids || []).map(Number))].filter(n => Number.isFinite(n) && n > 0);
   const force: boolean = body.force === true;
   if (!ids.length) return jsonResponse({ error: '请提供歌曲 ID 列表' }, 400);
 
@@ -438,8 +555,8 @@ router.post('/scrape/batch', async (req) => {
   };
   batchTasks.set(taskId, task);
 
-  // 异步执行
-  setTimeout(() => runBatchTask(taskId, task), 100);
+  // 异步执行（强制模式同时绕过结果缓存）
+  setTimeout(() => runBatchTask(taskId, task, { skipCache: force }), 100);
 
   return jsonResponse({ taskId, status: 'started', total: newIds.length, skipped: skipIds.length });
 });
@@ -463,9 +580,6 @@ router.get('/scrape/batch/progress', async (req) => {
   const task = batchTasks.get(taskId);
   if (!task) return jsonResponse({ error: '任务不存在' }, 404);
   const latest = task.results[task.results.length - 1];
-  if (task.status === 'done') {
-    setTimeout(() => batchTasks.delete(taskId), 60000);
-  }
   return jsonResponse({
     status: task.status,
     current: task.current,
@@ -484,11 +598,9 @@ router.get('/scrape/batch/progress', async (req) => {
 // 增量扫描：自动扫描所有未处理的歌曲
 router.post('/scrape/incremental', async () => {
   try {
-    const songs = await songloft.songs.list({ limit: 10000 });
+    const allIds = await listAllSongIds();
     const doneIds = await getScrapedDone();
-    const newIds = songs
-      .map(s => Number(s.id))
-      .filter(id => !doneIds.has(id));
+    const newIds = allIds.filter(id => !doneIds.has(id));
 
     if (!newIds.length) return jsonResponse({ message: '没有新的歌曲需要刮削', count: 0 });
 
@@ -497,7 +609,8 @@ router.post('/scrape/incremental', async () => {
     const task = {
       ids: newIds, current: 0, total: newIds.length,
       results: [] as any[], success: 0, skipped: 0, skippedIds: [] as number[],
-      failed: 0, failedIds: [] as number[], status: 'running' as const,
+      failed: 0, failedIds: [] as number[], status: 'running' as 'running' | 'done',
+      cancelled: false,
     };
     batchTasks.set(taskId, task);
 
@@ -516,13 +629,14 @@ router.post('/scrape/incremental', async () => {
   }
 });
 
-// 单曲刮削
+// 单曲刮削（?force=1 绕过结果缓存）
 router.post('/scrape/:id', async (req, params) => {
   const songId = parseInt(params?.id || '0', 10);
   if (!songId) return jsonResponse({ error: '无效的歌曲 ID' }, 400);
+  const force = /(?:^|&)force=1(?:&|$)/.test((req as any).query || '');
 
-  songloft.log.info(`[api] 刮削请求: songId=${songId}`);
-  const result = await scrapeSong(songId);
+  songloft.log.info(`[api] 刮削请求: songId=${songId}${force ? ' (强制)' : ''}`);
+  const result = await scrapeSong(songId, undefined, { skipCache: force });
   if (!result) {
     return jsonResponse({ error: '刮削失败，无匹配结果', songId }, 404);
   }
@@ -541,6 +655,81 @@ router.post('/cover/clear/:id', async (req, params) => {
     return jsonResponse({ error: '封面清除失败', songId }, 500);
   }
   return jsonResponse({ status: 'ok', file_write: result, songId });
+});
+
+// ============================================================
+// 撤销：恢复刮削写入前的原始标签快照
+// ============================================================
+router.post('/undo/:id', async (_req, params) => {
+  const songId = parseInt(params?.id || '0', 10);
+  if (!songId) return jsonResponse({ error: '无效的歌曲 ID' }, 400);
+
+  try {
+    const key = `backup_${songId}`;
+    const raw = await songloft.storage.get(key);
+    if (!raw || typeof raw !== 'object') {
+      return jsonResponse({ error: '无可撤销的记录' }, 404);
+    }
+    const backup = raw as Record<string, any>;
+
+    // 宿主 tags 语义为「非空覆盖，空值保留」：快照中为空的字段传了也不生效，
+    // 直接不传（省一次无效写），并把这些字段名回报给前端提示。
+    const body: Record<string, string | number> = {};
+    const restored: string[] = [];
+    const keptFilled: string[] = [];
+    const fields: [string, string | number][] = [
+      ['title', backup.title || ''],
+      ['artist', backup.artist || ''],
+      ['album', backup.album || ''],
+      ['genre', backup.genre || ''],
+      ['year', typeof backup.year === 'number' ? backup.year : 0],
+      ['track', backup.track || ''],
+      ['lyrics', backup.lyrics || ''],
+    ];
+    for (const [k, v] of fields) {
+      if (v === '' || v === 0) { keptFilled.push(k); continue; }
+      body[k] = v;
+      restored.push(k);
+    }
+
+    if (restored.length > 0) {
+      const token = await songloft.plugin.getToken();
+      const hostUrl = await songloft.plugin.getHostUrl();
+      const resp = await fetch(`${hostUrl}/api/v1/songs/${songId}/tags`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        return jsonResponse({ error: errText.substring(0, 200) }, resp.status);
+      }
+    }
+
+    await songloft.storage.delete(key);
+    await removeScrapedDone(songId);
+    songloft.log.info(`[undo] songId=${songId} 已恢复 ${restored.length} 个字段` + (keptFilled.length ? `，${keptFilled.length} 个原为空的字段无法清空` : ''));
+    return jsonResponse({ ok: true, restored, kept_filled: keptFilled });
+  } catch (e: any) {
+    return jsonResponse({ error: e.message || String(e) }, 500);
+  }
+});
+
+// 单曲已刮标记增/删（校对页采纳/撤销后持久化状态）
+router.post('/storage/scraped/:id', async (_req, params) => {
+  const songId = parseInt(params?.id || '0', 10);
+  if (!songId) return jsonResponse({ error: '无效的歌曲 ID' }, 400);
+  await markScrapedDone(songId);
+  return jsonResponse({ ok: true });
+});
+router.delete('/storage/scraped/:id', async (_req, params) => {
+  const songId = parseInt(params?.id || '0', 10);
+  if (!songId) return jsonResponse({ error: '无效的歌曲 ID' }, 400);
+  await removeScrapedDone(songId);
+  return jsonResponse({ ok: true });
 });
 
 // ============================================================
@@ -570,12 +759,14 @@ router.get('/song/:id', async (_req, params) => {
       } catch { /* ignore */ }
     }
     // 构建带认证的封面 URL（本地 cover 用相对路径 + access_token，外链直接用）
+    // 注意：宿主 CoverURLPath 返回 /api/v1/songs/{id}/cover?v=<ts> 已含查询串，须按 ?/& 拼接
     let coverUrl = '';
     if (s.cover_url) {
       if (s.cover_url.startsWith('http://') || s.cover_url.startsWith('https://')) {
         coverUrl = s.cover_url;
       } else {
-        coverUrl = `${s.cover_url}?access_token=${token}`;
+        const sep = s.cover_url.includes('?') ? '&' : '?';
+        coverUrl = `${s.cover_url}${sep}access_token=${token}`;
       }
     }
     return jsonResponse({
@@ -587,7 +778,7 @@ router.get('/song/:id', async (_req, params) => {
       lyrics: lyrics,
       genre: s.genre || '',
       year: s.year || '',
-      track: s.track_number || '',
+      track: s.track || '',
       file_path: s.file_path || '',
     });
   } catch (e: any) {
@@ -603,6 +794,15 @@ router.put('/tags/:id', async (req, params) => {
     const id = parseInt(params?.id || '0', 10);
     if (!id) return jsonResponse({ error: '无效 ID' }, 400);
     const body = parseBody(req);
+    // 校对页采纳等场景带 ?snapshot=1：写入前快照原始标签，供撤销恢复
+    if (/(?:^|&)snapshot=1(?:&|$)/.test((req as any).query || '')) {
+      await ensureBackup(id);
+    }
+    // 宿主 WriteSongTagsRequest.year 为 integer，前端可能传字符串
+    if (typeof body.year === 'string') {
+      const y = parseInt(body.year, 10);
+      body.year = isNaN(y) ? 0 : y;
+    }
     const token = await songloft.plugin.getToken();
     const host = await songloft.plugin.getHostUrl();
     const resp = await fetch(`${host}/api/v1/songs/${id}/tags`, {
@@ -612,6 +812,38 @@ router.put('/tags/:id', async (req, params) => {
         'Authorization': `Bearer ${token}`,
       },
       body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return jsonResponse({ error: errText.substring(0, 200) }, resp.status);
+    }
+    const data = await resp.json();
+    return jsonResponse(data);
+  } catch (e: any) {
+    return jsonResponse({ error: e.message || String(e) }, 500);
+  }
+});
+
+// ============================================================
+// 歌词写入代理（手动编辑走 lyrics 端点 + lyric_source=manual，重扫不覆盖）
+// ============================================================
+router.put('/lyrics/:id', async (req, params) => {
+  try {
+    const id = parseInt(params?.id || '0', 10);
+    if (!id) return jsonResponse({ error: '无效 ID' }, 400);
+    const body = parseBody(req);
+    const token = await songloft.plugin.getToken();
+    const host = await songloft.plugin.getHostUrl();
+    const resp = await fetch(`${host}/api/v1/songs/${id}/lyrics`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        lyric: body.lyric || '',
+        lyric_source: body.lyric_source || 'manual',
+      }),
     });
     if (!resp.ok) {
       const errText = await resp.text();
@@ -638,8 +870,11 @@ router.get('/songs', async (req) => {
     let songs;
     if (keyword) {
       songs = await songloft.songs.search(keyword);
-    } else {
+    } else if (params.get('limit')) {
       songs = await songloft.songs.list({ limit, offset });
+    } else {
+      // 未显式指定 limit 时分页拉全量（突破单次 10000 上限）
+      songs = await listAllSongs();
     }
 
     let token = '';
@@ -661,10 +896,11 @@ router.get('/songs', async (req) => {
         format: s.format || '',
         duration: s.duration || 0,
         cover_url: cUrl,
-        lyrics: (s as any).lyrics || '',
+        // Song 模型无 lyrics 字段，lyric_url 非空即视为有歌词（健康度用）
+        has_lyrics: !!(s as any).lyric_url,
         genre: (s as any).genre || '',
         year: (s as any).year || '',
-        track: (s as any).track_number || '',
+        track: (s as any).track || '',
       };
     });
 
@@ -691,35 +927,25 @@ router.get('/covers/:id', async (_req, params) => {
 
     const candidate = { artist: toSimplified(song.artist || ''), title: toSimplified(song.title || '') };
 
-    const tasks: Promise<{ covers: { url: string; source: string }[]; source: string }>[] = [];
+    // 每源保留结果的 artist/title 供评分（against 搜索结果，而非歌曲自身）
+    const tasks: Promise<{ covers: { url: string; source: string; artist: string; title: string }[]; source: string }>[] = [];
+    const mapCovers = (r: SearchResult[], label: string) =>
+      r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: label, artist: x.artist || '', title: x.title || '' }));
 
     if (cfg.enable_netease && cfg.netease_api_url) {
-      tasks.push(searchNetease(keyword, cfg.netease_api_url).then(r => ({
-        covers: r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: '网易云' })),
-        source: 'netease'
-      })));
+      tasks.push(searchNetease(keyword, cfg.netease_api_url).then(r => ({ covers: mapCovers(r, '网易云'), source: 'netease' })));
     }
     if (cfg.enable_qqmusic && cfg.qqmusic_api_url) {
-      tasks.push(searchQQMusic(keyword, cfg.qqmusic_api_url).then(r => ({
-        covers: r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: 'QQ音乐' })),
-        source: 'qqmusic'
-      })));
+      tasks.push(searchQQMusic(keyword, cfg.qqmusic_api_url).then(r => ({ covers: mapCovers(r, 'QQ音乐'), source: 'qqmusic' })));
     }
     if (cfg.enable_kugou && cfg.kugou_api_url) {
-      tasks.push(searchKuGou(keyword, cfg.kugou_api_url).then(r => ({
-        covers: r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: '酷狗' })),
-        source: 'kugou'
-      })));
+      tasks.push(searchKuGou(keyword, cfg.kugou_api_url).then(r => ({ covers: mapCovers(r, '酷狗'), source: 'kugou' })));
     }
-    tasks.push(searchMiGu(keyword).then(r => ({
-      covers: r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: '咪咕' })),
-      source: 'migu'
-    })));
+    if (cfg.enable_migu) {
+      tasks.push(searchMiGu(keyword).then(r => ({ covers: mapCovers(r, '咪咕'), source: 'migu' })));
+    }
     if (cfg.enable_kuwo) {
-      tasks.push(searchKuWo(keyword).then(r => ({
-        covers: r.filter(x => x.cover_url).map(x => ({ url: x.cover_url!, source: '酷我' })),
-        source: 'kuwo'
-      })));
+      tasks.push(searchKuWo(keyword).then(r => ({ covers: mapCovers(r, '酷我'), source: 'kuwo' })));
     }
 
     const settled = await Promise.allSettled(tasks);
@@ -736,7 +962,8 @@ router.get('/covers/:id', async (_req, params) => {
             const token = await songloft.plugin.getToken();
             url += (url.includes('?') ? '&' : '?') + 'access_token=' + token;
           }
-          const score = scoreMatch(candidate, { artist: song.artist || '', title: song.title || '', source: s.value.source });
+          // 对搜索结果本身评分，命中度高的封面排前
+          const score = scoreMatch(candidate, { artist: c.artist, title: c.title, source: s.value.source });
           allCovers.push({ url, source: c.source, score });
         }
       }
@@ -774,10 +1001,15 @@ router.get('/scrape/preview/:id', async (_req, params) => {
     if (!song) return jsonResponse({ error: '歌曲不存在', results: [] }, 404);
 
     const cfg = await loadConfig();
-    const keyword = `${song.artist || ''} ${song.title || ''}`.trim();
+    // 与 doScrape 一致：走 extractCandidates 清洗垃圾标签（如 "Track 01"）+ 繁简转换
+    const filePath = (song as any).file_path || (song as any).filePath || '';
+    const cand0 = extractCandidates(filePath, { artist: song.artist, title: song.title })[0];
+    cand0.artist = toSimplified(cand0.artist);
+    cand0.title = toSimplified(cand0.title);
+    const keyword = `${cand0.artist} ${cand0.title}`.trim();
     if (!keyword) return jsonResponse({ results: [] });
 
-    const candidate = { artist: toSimplified(song.artist || ''), title: toSimplified(song.title || ''), duration: song.duration };
+    const candidate = { artist: cand0.artist, title: cand0.title, duration: song.duration };
     const tasks: Promise<{ results: SearchResult[]; source: string }>[] = [];
 
     if (cfg.enable_netease && cfg.netease_api_url) {
@@ -789,7 +1021,9 @@ router.get('/scrape/preview/:id', async (_req, params) => {
     if (cfg.enable_kugou && cfg.kugou_api_url) {
       tasks.push(rateLimitWait('kugou').then(() => searchKuGou(keyword, cfg.kugou_api_url)).then(r => ({ results: r, source: '酷狗' })));
     }
-    tasks.push(rateLimitWait('migu').then(() => searchMiGu(keyword)).then(r => ({ results: r, source: '咪咕' })));
+    if (cfg.enable_migu) {
+      tasks.push(rateLimitWait('migu').then(() => searchMiGu(keyword)).then(r => ({ results: r, source: '咪咕' })));
+    }
     if (cfg.enable_kuwo) {
       tasks.push(rateLimitWait('kuwo').then(() => searchKuWo(keyword)).then(r => ({ results: r, source: '酷我' })));
     }
@@ -827,7 +1061,7 @@ router.get('/scrape/preview/:id', async (_req, params) => {
 router.get('/storage/failed', async (_req) => {
   try {
     const raw = await songloft.storage.get('failed_songs');
-    const arr = Array.isArray(raw) ? raw : (raw ? JSON.parse(raw) : []);
+    const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? JSON.parse(raw) : []);
     return jsonResponse(arr);
   } catch {
     return jsonResponse([]);
@@ -855,7 +1089,7 @@ router.get('/storage/scraped', async (_req) => {
 });
 router.delete('/storage/scraped', async (_req) => {
   try {
-    await songloft.storage.delete('scraped_done');
+    await clearScrapedDone();
     return jsonResponse({ ok: true });
   } catch (e: any) {
     return jsonResponse({ error: e.message || String(e) }, 500);
@@ -883,20 +1117,27 @@ router.post('/scrape/manual/:id', async (req, params) => {
     const allResults: any[] = [];
     const scores: Record<string, number> = {};
 
+    // 各源独立 try/catch：搜索函数失败会 throw，单源故障不拖垮整个手动刮削
     if (cfg.enable_netease && cfg.netease_api_url) {
-      const r = await searchNetease(keyword, cfg.netease_api_url);
-      r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
-      if (r.length) { scores['netease'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      try {
+        const r = await searchNetease(keyword, cfg.netease_api_url);
+        r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
+        if (r.length) { scores['netease'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      } catch (e: any) { songloft.log.warn(`[manual] netease 搜索失败: ${e.message || e}`); }
     }
     if (cfg.enable_qqmusic && cfg.qqmusic_api_url) {
-      const r = await searchQQMusic(keyword, cfg.qqmusic_api_url);
-      r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
-      if (r.length) { scores['qqmusic'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      try {
+        const r = await searchQQMusic(keyword, cfg.qqmusic_api_url);
+        r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
+        if (r.length) { scores['qqmusic'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      } catch (e: any) { songloft.log.warn(`[manual] qqmusic 搜索失败: ${e.message || e}`); }
     }
     if (cfg.enable_kugou && cfg.kugou_api_url) {
-      const r = await searchKuGou(keyword, cfg.kugou_api_url);
-      r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
-      if (r.length) { scores['kugou'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      try {
+        const r = await searchKuGou(keyword, cfg.kugou_api_url);
+        r.forEach((x: any) => { x.score = scoreMatch({ artist, title }, x); });
+        if (r.length) { scores['kugou'] = Math.max(...r.map((x: any) => x.score)); allResults.push(...r); }
+      } catch (e: any) { songloft.log.warn(`[manual] kugou 搜索失败: ${e.message || e}`); }
     }
 
     let best: any = null;
@@ -909,6 +1150,9 @@ router.post('/scrape/manual/:id', async (req, params) => {
       artist: best.artist,
       title: best.title,
       album: best.album || '',
+      genre: best.genre || '',
+      year: best.year || '',
+      track: best.track || '',
       cover_url: best.cover_url || '',
       source: best.source,
       score: best.score,
@@ -923,54 +1167,55 @@ router.post('/scrape/manual/:id', async (req, params) => {
 // 生命周期
 // ============================================================
 
-// 自动监测定时器
-let autoScanTimer: ReturnType<typeof setInterval> | null = null;
+// 自动监测定时器（自链式 setTimeout：上一批跑完才排下一次，批次耗时超过间隔也不会重叠执行）
+let autoScanTimer: ReturnType<typeof setTimeout> | null = null;
+let autoScanStopped = true;
 
 async function startAutoScan(): Promise<void> {
-  if (autoScanTimer) return;
+  if (!autoScanStopped) return; // 已在运行
   const cfg = await loadConfig();
   if (!cfg.enable_auto_scan) return;
 
   const intervalMs = (cfg.auto_scan_interval || 30) * 60 * 1000;
+  autoScanStopped = false;
   songloft.log.info(`[tag] 自动监测已启动，间隔 ${cfg.auto_scan_interval || 30} 分钟`);
 
-  autoScanTimer = setInterval(async () => {
+  const tick = async () => {
+    if (autoScanStopped) return;
     try {
-      const songs = await songloft.songs.list({ limit: 10000 });
+      const allIds = await listAllSongIds();
       const doneIds = await getScrapedDone();
-      const newIds = songs.map(s => Number(s.id)).filter(id => !doneIds.has(id));
-      if (newIds.length === 0) return;
-
-      // 清理旧的自动扫描任务（保留最近 5 个）
-      const autoScanTasks = [...batchTasks.entries()].filter(([k]) => k.startsWith('auto-'));
-      if (autoScanTasks.length > 5) {
-        for (const [oldId] of autoScanTasks.slice(0, autoScanTasks.length - 5)) {
-          batchTasks.delete(oldId);
-        }
+      const newIds = allIds.filter(id => !doneIds.has(id));
+      if (newIds.length > 0) {
+        songloft.log.info(`[auto-scan] 发现 ${newIds.length} 首新歌曲，开始增量扫描`);
+        const taskId = 'auto-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const task = {
+          ids: newIds, current: 0, total: newIds.length,
+          results: [] as any[], success: 0, skipped: 0, skippedIds: [] as number[],
+          failed: 0, failedIds: [] as number[], status: 'running' as 'running' | 'done',
+          cancelled: false,
+        };
+        batchTasks.set(taskId, task);
+        await runBatchTask(taskId, task);
+        songloft.log.info(`[auto-scan] 完成: 成功${task.success} 跳过${task.skipped} 失败${task.failed}`);
+        batchTasks.delete(taskId);
       }
-
-      songloft.log.info(`[auto-scan] 发现 ${newIds.length} 首新歌曲，开始增量扫描`);
-      const taskId = 'auto-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      const task = {
-        ids: newIds, current: 0, total: newIds.length,
-        results: [] as any[], success: 0, skipped: 0, skippedIds: [] as number[],
-        failed: 0, failedIds: [] as number[], status: 'running' as const,
-        cancelled: false,
-      };
-      batchTasks.set(taskId, task);
-      await runBatchTask(taskId, task);
-      songloft.log.info(`[auto-scan] 完成: 成功${task.success} 跳过${task.skipped} 失败${task.failed}`);
-      // 任务完成后删除
-      batchTasks.delete(taskId);
     } catch (e: any) {
       songloft.log.error(`[auto-scan] 异常: ${e.message || e}`);
+    } finally {
+      if (!autoScanStopped) {
+        autoScanTimer = setTimeout(tick, intervalMs);
+      }
     }
-  }, intervalMs);
+  };
+
+  autoScanTimer = setTimeout(tick, intervalMs);
 }
 
 function stopAutoScan(): void {
-  if (autoScanTimer) {
-    clearInterval(autoScanTimer);
+  autoScanStopped = true;
+  if (autoScanTimer !== null) {
+    clearTimeout(autoScanTimer);
     autoScanTimer = null;
     songloft.log.info('[tag] 自动监测已停止');
   }
@@ -1012,9 +1257,7 @@ async function onHTTPRequest(req: HTTPRequest): Promise<HTTPResponse> {
   return router.handle(req);
 }
 
-// @ts-expect-error — QuickJS 全局注入
+// QuickJS 全局注入（SDK declare global 已声明签名）
 globalThis.onInit = onInit;
-// @ts-expect-error
 globalThis.onDeinit = onDeinit;
-// @ts-expect-error
 globalThis.onHTTPRequest = onHTTPRequest;

@@ -142,9 +142,22 @@ export const SOURCE_WEIGHTS: Record<string, number> = {
   kuwo: 0.80,
 };
 
+// 标题/艺术家相似度权重（可由配置覆盖，loadConfig 时注入）
+let W_TITLE = 0.6;
+let W_ARTIST = 0.4;
+
+/** 设置评分权重（内部归一化，保证和为 1） */
+export function setScoreWeights(titleWeight: number, artistWeight: number): void {
+  const t = typeof titleWeight === 'number' && titleWeight > 0 ? titleWeight : 0.6;
+  const a = typeof artistWeight === 'number' && artistWeight > 0 ? artistWeight : 0.4;
+  const sum = t + a;
+  W_TITLE = t / sum;
+  W_ARTIST = a / sum;
+}
+
 /**
  * 计算候选标签与搜索结果的匹配得分
- * 公式: 0.4 × artist_similarity + 0.6 × title_similarity
+ * 公式: artist_weight × artist_similarity + title_weight × title_similarity
  * 再乘以源权重，最后应用时长惩罚
  */
 export function scoreMatch(
@@ -160,7 +173,7 @@ export function scoreMatch(
 
   const artistSim = sequenceSimilarity(artistCand, artistRes);
   const titleSim = sequenceSimilarity(titleCand, titleRes);
-  let rawScore = 0.4 * artistSim + 0.6 * titleSim;
+  let rawScore = W_ARTIST * artistSim + W_TITLE * titleSim;
   const weight = SOURCE_WEIGHTS[result.source] || 0.8;
   let score = rawScore * weight;
 

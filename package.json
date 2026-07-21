@@ -1,10 +1,11 @@
 {
   "name": "songloft-plugin-tag",
-  "version": "2.2.0",
+  "version": "2.3.1",
   "private": true,
   "scripts": {
     "build": "songloft-plugin build",
-    "dev": "songloft-plugin dev"
+    "dev": "songloft-plugin dev",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@songloft/plugin-builder": "^2.4.3",

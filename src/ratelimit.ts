@@ -21,25 +21,24 @@ const DEFAULT_BURST = 5;     // 最大突发量
  * @param burst   最大突发量（默认 5）
  */
 export async function rateLimitWait(source: string, rate = DEFAULT_RATE, burst = DEFAULT_BURST): Promise<void> {
-  const now = Date.now();
   let b = buckets[source];
   if (!b) {
-    b = { tokens: burst, lastRefill: now };
+    b = { tokens: burst, lastRefill: Date.now() };
     buckets[source] = b;
   }
 
-  // 补充令牌
-  const elapsed = (now - b.lastRefill) / 1000;
-  b.tokens = Math.min(burst, b.tokens + elapsed * rate);
-  b.lastRefill = now;
+  // 循环：睡醒后重新补充并检查（多个 waiter 同时醒来时只有拿到令牌的才通过，不会超发）
+  for (;;) {
+    const now = Date.now();
+    const elapsed = (now - b.lastRefill) / 1000;
+    b.tokens = Math.min(burst, b.tokens + elapsed * rate);
+    b.lastRefill = now;
 
-  if (b.tokens < 1) {
-    // 需要等待
+    if (b.tokens >= 1) {
+      b.tokens -= 1;
+      return;
+    }
     const waitMs = ((1 - b.tokens) / rate) * 1000;
     await new Promise(r => setTimeout(r, Math.ceil(waitMs)));
-    b.tokens = 1;
-    b.lastRefill = Date.now();
   }
-
-  b.tokens -= 1;
 }

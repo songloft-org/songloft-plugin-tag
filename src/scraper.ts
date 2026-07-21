@@ -19,10 +19,9 @@ import {
 } from './sources';
 import { scoreMatch } from './scoring';
 import { toSimplified } from './t2s';
-import { cacheGet, cacheSet, cacheCleanup } from './cache';
+import { cacheGet, cacheSet } from './cache';
 import { rateLimitWait } from './ratelimit';
 import { circuitFailure, circuitSuccess, circuitIsOpen } from './circuit';
-import { createSemaphore } from './semaphore';
 
 export interface ScrapeResult {
   songId: number;
@@ -45,9 +44,9 @@ export interface ScrapeResult {
 /**
  * 单曲刮削（写入模式）
  */
-export async function scrapeSong(songId: number, config?: ScraperConfig): Promise<ScrapeResult | null> {
+export async function scrapeSong(songId: number, config?: ScraperConfig, opts?: { skipCache?: boolean }): Promise<ScrapeResult | null> {
   const cfg = config || await loadConfig();
-  const result = await doScrape(songId, cfg);
+  const result = await doScrape(songId, cfg, opts);
   if (!result) return null;
 
   // 写回标签
@@ -56,79 +55,11 @@ export async function scrapeSong(songId: number, config?: ScraperConfig): Promis
   return result;
 }
 
-/**
- * 单曲刮削预览（不写入，返回匹配结果供 UI 展示）
- */
-export async function previewScrape(songId: number, config?: ScraperConfig): Promise<ScrapeResult | null> {
-  const cfg = config || await loadConfig();
-  return doScrape(songId, cfg);
-}
-
-/**
- * 批量刮削（支持并发控制）
- */
-export async function scrapeBatch(songIds: number[], config?: ScraperConfig): Promise<{
-  results: ScrapeResult[];
-  success: number;
-  skipped: number;
-  skippedIds: number[];
-  failed: number;
-  failedIds: number[];
-}> {
-  const cfg = config || await loadConfig();
-  const results: ScrapeResult[] = [];
-  const sortKeys = new Map<ScrapeResult, number>();
-  let success = 0;
-  let skipped = 0;
-  const skippedIds: number[] = [];
-  let failed = 0;
-  const failedIds: number[] = [];
-  const sem = createSemaphore(cfg.max_concurrency || 2);
-
-  await Promise.all(songIds.map(async (songId) => {
-    await sem.acquire();
-    try {
-      const result = await doScrape(songId, cfg);
-      if (!result) {
-        skipped++;
-        skippedIds.push(songId);
-        return;
-      }
-
-      const writeResult = await writeTags(songId, result);
-      result.fileWriteStatus = writeResult;
-      // 使用 Map 存储排序键，避免污染返回对象
-      sortKeys.set(result, songIds.indexOf(songId));
-      results.push(result);
-
-      if (writeResult === 'ok') {
-        success++;
-      } else {
-        failed++;
-        failedIds.push(songId);
-      }
-    } catch {
-      failed++;
-      failedIds.push(songId);
-    } finally {
-      sem.release();
-    }
-  }));
-
-  // 恢复原始顺序
-  results.sort((a, b) => (sortKeys.get(a) || 0) - (sortKeys.get(b) || 0));
-
-  // 批量刮削完成后清理过期缓存
-  cacheCleanup().catch(() => {});
-
-  return { results, success, skipped, skippedIds, failed, failedIds };
-}
-
 // ============================================================
 // 内部实现
 // ============================================================
 
-export async function doScrape(songId: number, cfg: ScraperConfig): Promise<ScrapeResult | null> {
+export async function doScrape(songId: number, cfg: ScraperConfig, opts?: { skipCache?: boolean }): Promise<ScrapeResult | null> {
   // 1. 获取歌曲信息
   const song = await songloft.songs.getById(songId);
   if (!song) {
@@ -136,7 +67,15 @@ export async function doScrape(songId: number, cfg: ScraperConfig): Promise<Scra
     return null;
   }
 
-  const filePath = song.file_path || '';
+  // 仅支持本地歌曲：宿主 /tags 对非 local 类型直接 400，搜了也写不进去（批量中计为跳过）
+  const songType = (song as any).type || 'local';
+  if (songType !== 'local') {
+    songloft.log.info(`[scraper] 跳过非本地歌曲: songId=${songId} (type=${songType})`);
+    return null;
+  }
+
+  // SDK 类型声明为 filePath，但运行时桥接返回 file_path（与宿主 JSON 一致），两者兜底
+  const filePath = (song as any).file_path || (song as any).filePath || '';
   const candidates = extractCandidates(filePath, { artist: song.artist, title: song.title });
 
   // 繁体→简体，提高国内音源匹配率
@@ -152,80 +91,77 @@ export async function doScrape(songId: number, cfg: ScraperConfig): Promise<Scra
     return null;
   }
 
-  // 文本搜索：先用第一个候选词搜索，若得分不佳且有反向候选则重试
+  // 缓存字段辅助：entry 带 enriched 标记，避免「源本来就没有 genre」时每次命中都重跑 enrich
+  const toCacheEntry = (r: { artist: string; title: string; album: string; cover_url?: string; lyrics?: string; genre?: string; year?: string; track?: string; source: string; score: number }) => ({
+    artist: r.artist, title: r.title, album: r.album,
+    cover_url: r.cover_url, lyrics: r.lyrics,
+    genre: r.genre || '', year: r.year || '', track: r.track || '',
+    source: r.source, score: r.score,
+    enriched: true,
+  });
+
+  // 检查缓存（强制刮削跳过读取，但仍会写入覆盖旧缓存）
+  if (!opts?.skipCache) {
+    const cached = await cacheGet<SearchResult & { enriched?: boolean }>(candidate.artist, candidate.title);
+    if (cached && cached.score >= cfg.score_threshold) {
+      songloft.log.info(`[scraper] 缓存命中: ${cached.artist} - ${cached.title} (${cached.score.toFixed(2)})`);
+      // 旧缓存（无 enriched 标记）补跑一次 enrich 并回写，此后命中不再重复请求
+      if (!cached.enriched) {
+        const enrich = await enrichFromChineseSources(cached.artist, cached.title, candidate, cfg);
+        if (enrich.genre) cached.genre = enrich.genre;
+        if (enrich.year) cached.year = enrich.year;
+        if (enrich.track) cached.track = enrich.track;
+        if (enrich.cover_url && !cached.cover_url) cached.cover_url = enrich.cover_url;
+        if (enrich.lyrics && !cached.lyrics) cached.lyrics = enrich.lyrics;
+        await cacheSet(candidate.artist, candidate.title, toCacheEntry(cached));
+      }
+      return buildResult(songId, cached, candidate, {});
+    }
+  }
+
+  // 2. 声纹优先（指纹与候选关键词无关，只查一次，不进候选循环）
+  if (!cfg.enable_acoustid) {
+    songloft.log.info(`[scraper] AcoustID 未启用 (cfg.enable_acoustid=${cfg.enable_acoustid})`);
+  } else if (!song.fingerprint) {
+    songloft.log.info(`[scraper] AcoustID 跳过: 歌曲无指纹 (主程序扫描后异步计算，请稍后重试)`);
+  } else {
+    await rateLimitWait('acoustid');
+    const acoustidResults = await searchAcoustid(song.fingerprint, song.fingerprint_duration || song.duration || 0, cfg.acoustid_api_key);
+    if (acoustidResults.length > 0) {
+      const best = acoustidResults.reduce((a, b) => a.score > b.score ? a : b);
+      if (best.score > cfg.score_threshold) {
+        songloft.log.info(`[scraper] 声纹匹配成功: ${best.artist} - ${best.title} (${best.score.toFixed(2)})`);
+
+        best.artist = toSimplified(best.artist);
+        best.title = toSimplified(best.title);
+        best.album = toSimplified(best.album);
+
+        const enrich = await enrichFromChineseSources(best.artist, best.title, candidate, cfg);
+        if (enrich.cover_url) {
+          best.cover_url = enrich.cover_url;
+          songloft.log.info(`[scraper] 封面来自 ${enrich.source}: ${enrich.cover_url.substring(0, 60)}...`);
+        }
+        if (enrich.lyrics) best.lyrics = enrich.lyrics;
+        if (enrich.genre) best.genre = enrich.genre;
+        if (enrich.year) best.year = enrich.year;
+        if (enrich.track) best.track = enrich.track;
+
+        const result = buildResult(songId, best, candidate, {});
+        await cacheSet(candidate.artist, candidate.title, toCacheEntry(result));
+        return result;
+      }
+    }
+  }
+
+  // 3. 文本搜索兜底（多源并发）：先用第一个候选词搜索，若得分不佳且有反向候选则重试
   let bestResult: ScrapeResult | null = null;
   let bestScore = -1;
-
-  // 检查缓存
-  const cacheKey = `${candidate.artist} ${candidate.title}`;
-  const cached = await cacheGet<SearchResult>(candidate.artist, candidate.title);
-  if (cached && cached.score >= cfg.score_threshold) {
-    songloft.log.info(`[scraper] 缓存命中: ${cached.artist} - ${cached.title} (${cached.score.toFixed(2)})`);
-    // 缓存可能缺少 genre/year/track，任一字段缺失即触发补全
-    if (!cached.genre || !cached.year || !cached.track) {
-      const enrich = await enrichFromChineseSources(cached.artist, cached.title, candidate, cfg, filePath);
-      if (enrich.genre) cached.genre = enrich.genre;
-      if (enrich.year) cached.year = enrich.year;
-      if (enrich.track) cached.track = enrich.track;
-      if (enrich.cover_url && !cached.cover_url) cached.cover_url = enrich.cover_url;
-      if (enrich.lyrics && !cached.lyrics) cached.lyrics = enrich.lyrics;
-    }
-    return buildResult(songId, cached, candidate, {});
-  }
 
   for (let ci = 0; ci < candidates.length; ci++) {
     const c = candidates[ci];
     const keyword = `${c.artist} ${c.title}`.trim();
     songloft.log.info(`[scraper] 开始刮削: ${keyword} (songId=${songId}${ci > 0 ? ', 反向排序' : ''})`);
 
-    // 2. 声纹优先（使用主程序已计算的指纹）
-    if (!cfg.enable_acoustid) {
-      songloft.log.info(`[scraper] AcoustID 未启用 (cfg.enable_acoustid=${cfg.enable_acoustid})`);
-    } else if (!song.fingerprint) {
-      songloft.log.info(`[scraper] AcoustID 跳过: 歌曲无指纹 (主程序扫描后异步计算，请稍后重试)`);
-    } else {
-      await rateLimitWait('acoustid');
-      const acoustidResults = await searchAcoustid(song.fingerprint, song.fingerprint_duration || song.duration || 0, cfg.acoustid_api_key);
-      if (acoustidResults.length > 0) {
-        const best = acoustidResults.reduce((a, b) => a.score > b.score ? a : b);
-        if (best.score > cfg.score_threshold) {
-          songloft.log.info(`[scraper] 声纹匹配成功: ${best.artist} - ${best.title} (${best.score.toFixed(2)})`);
-
-          best.artist = toSimplified(best.artist);
-          best.title = toSimplified(best.title);
-          best.album = toSimplified(best.album);
-
-          const enrich = await enrichFromChineseSources(best.artist, best.title, c, cfg, filePath);
-          if (enrich.cover_url) {
-            best.cover_url = enrich.cover_url;
-            songloft.log.info(`[scraper] 封面来自 ${enrich.source}: ${enrich.cover_url.substring(0, 60)}...`);
-          }
-          if (enrich.lyrics) {
-            best.lyrics = enrich.lyrics;
-          }
-          if (enrich.genre) {
-            best.genre = enrich.genre;
-          }
-          if (enrich.year) {
-            best.year = enrich.year;
-          }
-          if (enrich.track) {
-            best.track = enrich.track;
-          }
-
-          const result = buildResult(songId, best, c, {});
-          // 写入缓存
-          await cacheSet(candidate.artist, candidate.title, {
-            artist: result.artist, title: result.title, album: result.album,
-            cover_url: result.cover_url, lyrics: result.lyrics,
-            source: result.source, score: result.score,
-          });
-          return result;
-        }
-      }
-    }
-
-    // 3. 文本搜索兜底（多源并发）
     const sourceScores: Record<string, number> = {};
     const allResults: SearchResult[] = [];
 
@@ -308,16 +244,8 @@ export async function doScrape(songId: number, cfg: ScraperConfig): Promise<Scra
     return null;
   }
 
-  // 写入缓存
-  await cacheSet(candidate.artist, candidate.title, {
-    artist: bestResult.artist,
-    title: bestResult.title,
-    album: bestResult.album,
-    cover_url: bestResult.cover_url,
-    lyrics: bestResult.lyrics,
-    source: bestResult.source,
-    score: bestResult.score,
-  });
+  // 写入缓存（文本搜索结果自带 genre/year/track，视为已补全）
+  await cacheSet(candidate.artist, candidate.title, toCacheEntry(bestResult));
 
   songloft.log.info(`[scraper] 选用 ${bestResult.source} (${bestResult.score.toFixed(2)})`);
   return bestResult;
@@ -346,10 +274,70 @@ function buildResult(
 }
 
 /**
+ * 从宿主获取歌曲完整信息 + 歌词内容（快照 / 清封面共用）
+ */
+export async function fetchSongFromHost(songId: number): Promise<{ song: any; lyrics: string } | null> {
+  const token = await songloft.plugin.getToken();
+  const hostUrl = await songloft.plugin.getHostUrl();
+  const getResp = await fetch(`${hostUrl}/api/v1/songs/${songId}`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  if (!getResp.ok) return null;
+  const song = await getResp.json();
+  let lyrics = '';
+  if (song.lyric_url) {
+    try {
+      const lr = await fetch(`${hostUrl}${song.lyric_url}`, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (lr.ok) {
+        const raw = await lr.text();
+        try { lyrics = JSON.parse(raw).lyric || raw; } catch { lyrics = raw; }
+      }
+    } catch { /* ignore */ }
+  }
+  return { song, lyrics };
+}
+
+const BACKUP_KEY_PREFIX = 'backup_';
+
+/**
+ * 首次写入前快照原始标签。已存在则不覆盖——多次重刮后撤销仍恢复真·原始值。
+ * 快照失败仅告警不阻塞写入（此时宿主大概率也不可用，写入会自行失败）。
+ */
+export async function ensureBackup(songId: number): Promise<void> {
+  try {
+    const key = BACKUP_KEY_PREFIX + songId;
+    const existing = await songloft.storage.get(key);
+    if (existing) return;
+    const fetched = await fetchSongFromHost(songId);
+    if (!fetched) {
+      songloft.log.warn(`[backup] 获取歌曲信息失败，跳过快照: songId=${songId}`);
+      return;
+    }
+    const { song, lyrics } = fetched;
+    await songloft.storage.set(key, {
+      title: song.title || '',
+      artist: song.artist || '',
+      album: song.album || '',
+      genre: song.genre || '',
+      year: typeof song.year === 'number' ? song.year : 0,
+      track: song.track || '',
+      lyrics,
+      ts: Date.now(),
+    });
+  } catch (e: any) {
+    songloft.log.warn(`[backup] 快照失败 songId=${songId}: ${e.message || e}`);
+  }
+}
+
+/**
  * 调用宿主 API 将标签写入歌曲
  */
 export async function writeTags(songId: number, result: ScrapeResult): Promise<string> {
   try {
+    // 首次写入前快照原始标签，供撤销恢复
+    await ensureBackup(songId);
     const token = await songloft.plugin.getToken();
     const hostUrl = await songloft.plugin.getHostUrl();
 
@@ -402,29 +390,13 @@ export async function clearCover(songId: number): Promise<string> {
     const token = await songloft.plugin.getToken();
     const hostUrl = await songloft.plugin.getHostUrl();
 
-    // 先获取当前歌曲元数据
-    const getResp = await fetch(`${hostUrl}/api/v1/songs/${songId}`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-    if (!getResp.ok) {
-      songloft.log.error(`[scraper] 清除封面前获取歌曲信息失败 (HTTP ${getResp.status})`);
+    // 先获取当前歌曲元数据 + 歌词
+    const fetched = await fetchSongFromHost(songId);
+    if (!fetched) {
+      songloft.log.error(`[scraper] 清除封面前获取歌曲信息失败: songId=${songId}`);
       return 'failed';
     }
-    const song = await getResp.json();
-
-    // 获取歌词内容
-    let lyrics = '';
-    if (song.lyric_url) {
-      try {
-        const lr = await fetch(`${hostUrl}${song.lyric_url}`, {
-          headers: { 'Authorization': `Bearer ${token}` },
-        });
-        if (lr.ok) {
-          const raw = await lr.text();
-          try { lyrics = JSON.parse(raw).lyric || raw; } catch { lyrics = raw; }
-        }
-      } catch { /* ignore */ }
-    }
+    const { song, lyrics } = fetched;
 
     const body: Record<string, string | boolean> = {
       title: song.title || '',
@@ -432,7 +404,7 @@ export async function clearCover(songId: number): Promise<string> {
       album: song.album || '',
       genre: (song as any).genre || '',
       year: (song as any).year || '',
-      track: (song as any).track_number || '',
+      track: (song as any).track || '',
       lyrics: lyrics,
       clear_cover: true,
     };

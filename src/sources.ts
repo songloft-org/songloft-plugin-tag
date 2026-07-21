@@ -6,7 +6,7 @@ import { circuitIsOpen, circuitSuccess, circuitFailure } from './circuit';
 // 刮削源客户端
 // ============================================================
 
-import { scoreMatch } from './scoring';
+import { scoreMatch, setScoreWeights } from './scoring';
 
 import { ModeOfOperation, utils } from 'aes-js';
 
@@ -55,24 +55,35 @@ function isHostnameAllowed(url: string): boolean {
 
 // ----
 // ---- 指数退避重试（弱网减少失败率）----
+// 重试耗尽后 throw（错误信号向上传递给熔断器）；HTTP 非 2xx 同样视为源故障 throw。
+// 响应合法但无结果时由调用方返回 []。
 async function fetchWithRetry(
   url: string,
   init?: any,
   retries = 2,
   baseDelay = 1000
-): Promise<{ resp: any; ok: boolean }> {
+): Promise<any> {
+  let lastErr: any = null;
   for (let i = 0; i <= retries; i++) {
     try {
       const resp = await fetch(url, init);
-      return { resp, ok: true };
+      if (!resp.ok) {
+        // 4xx（除 429 限流）重试无意义，直接抛
+        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+          throw Object.assign(new Error(`HTTP ${resp.status}`), { noRetry: true });
+        }
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return resp;
     } catch (e: any) {
-      if (i === retries) return { resp: null, ok: false };
+      lastErr = e;
+      if (i === retries || e.noRetry) break;
       const delay = baseDelay * Math.pow(2, i);
       songloft.log.info(`[retry] ${delay}ms 后重试 (${i + 1}/${retries + 1}): ${e.message || e}`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  return { resp: null, ok: false };
+  throw lastErr || new Error('fetch failed');
 }
 
 // ---- 配置接口 ----
@@ -90,6 +101,10 @@ export interface ScraperConfig {
   enable_migu: boolean;
   /** 评分阈值，低于此分数视为匹配失败（默认 0.7） */
   score_threshold: number;
+  /** 标题相似度权重（默认 0.6，与 artist_weight 归一化后生效） */
+  title_weight: number;
+  /** 艺术家相似度权重（默认 0.4） */
+  artist_weight: number;
   /** 广告过滤：自动清理歌词中的推广信息 */
   enable_ad_filter: boolean;
   /** 自定义广告关键词（逗号分隔） */
@@ -115,6 +130,8 @@ export const DEFAULT_CONFIG: ScraperConfig = {
   kuwo_api_url: '',
   enable_migu: false,
   score_threshold: 0.7,
+  title_weight: 0.6,
+  artist_weight: 0.4,
   enable_ad_filter: true,
   ad_filter_keywords: '',
   max_concurrency: 2,
@@ -153,7 +170,7 @@ export async function searchAcoustid(fingerprint: string, duration: number, apiK
     // 使用 POST 避免指纹过长导致 URL 414（Chromaprint base64 指纹长度与歌曲时长成正比）
     const body = `client=${encodeURIComponent(apiKey)}&duration=${Math.round(duration)}&fingerprint=${encodeURIComponent(fingerprint)}&meta=recordingids`;
 
-    const rt = await fetchWithRetry('https://api.acoustid.org/v2/lookup', {
+    const resp = await fetchWithRetry('https://api.acoustid.org/v2/lookup', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -161,14 +178,6 @@ export async function searchAcoustid(fingerprint: string, duration: number, apiK
       },
       body,
     });
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-
-    if (resp.status === 429) {
-      songloft.log.warn('[acoustid] 限流，降级到文本搜索');
-      return [];
-    }
-    if (!resp.ok) return [];
 
     const data = await resp.json();
     if (data.status !== 'ok') return [];
@@ -199,13 +208,10 @@ export async function searchAcoustid(fingerprint: string, duration: number, apiK
 
 async function fetchMusicBrainz(recordingId: string): Promise<{ artist: string; title: string; album: string; duration?: number } | null> {
   try {
-    const rt = await fetchWithRetry(
+    const resp = await fetchWithRetry(
       `https://musicbrainz.org/ws/2/recording/${recordingId}?inc=artists+releases&fmt=json`,
       { headers: { 'User-Agent': 'songloft-plugin-tag/1.0' } }
     );
-    if (!rt.ok) return null;
-    const resp = rt.resp;
-    if (!resp.ok) return null;
 
     const mb = await resp.json();
     const artist = mb['artist-credit']?.[0]?.artist?.name || mb['artist-credit']?.[0]?.name || '';
@@ -292,55 +298,18 @@ function eapiEncrypt(urlPath: string, body: Record<string, any>): string {
 }
 
 // ---- 网易云音乐 ----
+// 约定：网络/HTTP/解析失败 throw（计入熔断），响应合法但无结果返回 []
 export async function searchNetease(keyword: string, apiUrl: string): Promise<SearchResult[]> {
   if (!apiUrl || !isHostnameAllowed(apiUrl)) return [];
   // eapi endpoint: use encryption
   if (apiUrl.indexOf('eapi') > -1) {
-    try {
-      const body = { s: keyword, type: 1, limit: 3, offset: 0, total: true };
-      const params = eapiEncrypt('/api/cloudsearch/pc', body);
-      const rt = await fetchWithRetry(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': 'os=pc; appver=2.9.7; MUSIC_U=; __csrf=', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        body: 'params=' + encodeURIComponent(params),
-      });
-      if (!rt.ok) return [];
-      const resp = rt.resp;
-      if (!resp.ok) return [];
-      const data = await resp.json();
-      const songs = data?.result?.songs || [];
-      return songs.map((s: any) => ({
-        artist: s.ar?.[0]?.name || '',
-        title: s.name || '',
-        album: s.al?.name || '',
-        cover_url: s.al?.picUrl ? s.al.picUrl + '?param=500y500' : undefined,
-        sourceId: s.id ? String(s.id) : undefined,
-        release_date: undefined,
-        genre: s.t?.[0]?.name || '',
-        year: s.publishTime ? String(new Date(s.publishTime).getFullYear()) : '',
-        track: s.no ? String(s.no) : '',
-        score: 0,
-        source: 'netease',
-      }));
-    } catch {
-      return [];
-    }
-  }
-  // Legacy plain POST
-  try {
-    const rt = await fetchWithRetry(apiUrl, {
+    const body = { s: keyword, type: 1, limit: 3, offset: 0, total: true };
+    const params = eapiEncrypt('/api/cloudsearch/pc', body);
+    const resp = await fetchWithRetry(apiUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': 'https://music.163.com',
-        'User-Agent': 'Mozilla/5.0',
-      },
-      body: 's=' + encodeURIComponent(keyword) + '&type=1&limit=3',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': 'os=pc; appver=2.9.7; MUSIC_U=; __csrf=', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      body: 'params=' + encodeURIComponent(params),
     });
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-    if (!resp.ok) return [];
-
     const data = await resp.json();
     const songs = data?.result?.songs || [];
     return songs.map((s: any) => ({
@@ -356,155 +325,152 @@ export async function searchNetease(keyword: string, apiUrl: string): Promise<Se
       score: 0,
       source: 'netease',
     }));
-  } catch {
-    return [];
   }
+  // Legacy plain POST
+  const resp = await fetchWithRetry(apiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': 'https://music.163.com',
+      'User-Agent': 'Mozilla/5.0',
+    },
+    body: 's=' + encodeURIComponent(keyword) + '&type=1&limit=3',
+  });
+
+  const data = await resp.json();
+  const songs = data?.result?.songs || [];
+  return songs.map((s: any) => ({
+    artist: s.ar?.[0]?.name || '',
+    title: s.name || '',
+    album: s.al?.name || '',
+    cover_url: s.al?.picUrl ? s.al.picUrl + '?param=500y500' : undefined,
+    sourceId: s.id ? String(s.id) : undefined,
+    release_date: undefined,
+    genre: s.t?.[0]?.name || '',
+    year: s.publishTime ? String(new Date(s.publishTime).getFullYear()) : '',
+    track: s.no ? String(s.no) : '',
+    score: 0,
+    source: 'netease',
+  }));
 }
 
 // ---- QQ 音乐 ----
 export async function searchQQMusic(keyword: string, apiUrl: string): Promise<SearchResult[]> {
   if (!apiUrl || !isHostnameAllowed(apiUrl)) return [];
-  try {
-    const rt = await fetchWithRetry(
-      `${apiUrl}?w=${encodeURIComponent(keyword)}&format=json&n=3`,
-      {
-        headers: {
-          'Referer': 'https://y.qq.com',
-          'User-Agent': 'Mozilla/5.0',
-        },
-      }
-    );
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-    if (!resp.ok) return [];
+  const resp = await fetchWithRetry(
+    `${apiUrl}?w=${encodeURIComponent(keyword)}&format=json&n=3`,
+    {
+      headers: {
+        'Referer': 'https://y.qq.com',
+        'User-Agent': 'Mozilla/5.0',
+      },
+    }
+  );
 
-    const data = await resp.json();
-    const songs = data?.data?.song?.list || [];
-    return songs.map((s: any) => ({
-      artist: s.singer?.[0]?.name || '',
-      title: s.songname || '',
-      album: s.albumname || '',
-      cover_url: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R500x500M000${s.albummid}.jpg` : undefined,
-      sourceId: s.songmid || undefined,
-      release_date: undefined,
-      genre: '',
-      year: '',
-      track: s.index ? String(s.index) : '',
-      score: 0,
-      source: 'qqmusic',
-    }));
-  } catch {
-    return [];
-  }
+  const data = await resp.json();
+  const songs = data?.data?.song?.list || [];
+  return songs.map((s: any) => ({
+    artist: s.singer?.[0]?.name || '',
+    title: s.songname || '',
+    album: s.albumname || '',
+    cover_url: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R500x500M000${s.albummid}.jpg` : undefined,
+    sourceId: s.songmid || undefined,
+    release_date: undefined,
+    genre: '',
+    year: '',
+    track: s.index ? String(s.index) : '',
+    score: 0,
+    source: 'qqmusic',
+  }));
 }
 
 // ---- 酷狗音乐 ----
 export async function searchKuGou(keyword: string, apiUrl: string): Promise<SearchResult[]> {
   if (!apiUrl || !isHostnameAllowed(apiUrl)) return [];
-  try {
-    const rt = await fetchWithRetry(
-      `${apiUrl}?keyword=${encodeURIComponent(keyword)}&page=1&pagesize=3`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' } }
-    );
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-    if (!resp.ok) return [];
+  const resp = await fetchWithRetry(
+    `${apiUrl}?keyword=${encodeURIComponent(keyword)}&page=1&pagesize=3`,
+    { headers: { 'User-Agent': 'Mozilla/5.0' } }
+  );
 
-    const data = await resp.json();
-    const songs = data?.data?.lists || [];
-    return songs.map((s: any) => ({
-      artist: s.SingerName || '',
-      title: s.SongName || '',
-      album: s.AlbumName || '',
-      cover_url: s.AlbumImg?.replace(/\/{2,}/g, '/') || undefined,
-      sourceId: s.Hash || s.FileHash || undefined,
-      release_date: undefined,
-      genre: '',
-      year: s.Chapter || '',
-      track: s.FileSort ? String(s.FileSort) : '',
-      score: 0,
-      source: 'kugou',
-    }));
-  } catch {
-    return [];
-  }
+  const data = await resp.json();
+  const songs = data?.data?.lists || [];
+  return songs.map((s: any) => ({
+    artist: s.SingerName || '',
+    title: s.SongName || '',
+    album: s.AlbumName || '',
+    // 先替换 {size} 占位符，再压缩重复斜杠（保护 :// 协议头）
+    cover_url: s.AlbumImg ? s.AlbumImg.replace(/\{size\}/g, '400').replace(/([^:])\/{2,}/g, '$1/') : undefined,
+    sourceId: s.Hash || s.FileHash || undefined,
+    release_date: undefined,
+    genre: '',
+    year: s.Chapter || '',
+    track: s.FileSort ? String(s.FileSort) : '',
+    score: 0,
+    source: 'kugou',
+  }));
 }
 
 
 // ---- 咪咕音乐（v1 API）----
 export async function searchMiGu(keyword: string): Promise<SearchResult[]> {
-  try {
-    const searchSwitch = JSON.stringify({ song: 1, album: 0, singer: 0, tagSong: 1, mvSong: 0, bestShow: 1 });
-    const qs = `text=${encodeURIComponent(keyword)}&pageNo=1&pageSize=10&isCopyright=1&sort=1&searchSwitch=${encodeURIComponent(searchSwitch)}`;
-    const rt = await fetchWithRetry(
-      `https://c.musicapp.migu.cn/v1.0/content/search_all.do?${qs}`,
-      {
-        headers: {
-          'ua': 'Android_migu',
-          'version': '7.0.0',
-          'channel': '014021I',
-          'User-Agent': 'MIGU/7.0.0 (Android 12)',
-          'Referer': 'https://music.migu.cn/',
-        },
-      }
-    );
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-    if (!resp.ok) return [];
+  const searchSwitch = JSON.stringify({ song: 1, album: 0, singer: 0, tagSong: 1, mvSong: 0, bestShow: 1 });
+  const qs = `text=${encodeURIComponent(keyword)}&pageNo=1&pageSize=10&isCopyright=1&sort=1&searchSwitch=${encodeURIComponent(searchSwitch)}`;
+  const resp = await fetchWithRetry(
+    `https://c.musicapp.migu.cn/v1.0/content/search_all.do?${qs}`,
+    {
+      headers: {
+        'ua': 'Android_migu',
+        'version': '7.0.0',
+        'channel': '014021I',
+        'User-Agent': 'MIGU/7.0.0 (Android 12)',
+        'Referer': 'https://music.migu.cn/',
+      },
+    }
+  );
 
-    const body = await resp.json();
+  const body = await resp.json();
 
-    const songs = body?.songResultData?.result || [];
-    return songs.map((s: any) => ({
-      artist: (s.singers || []).map((si: any) => si.name).join(',') || '',
-      title: s.name || '',
-      album: (s.albums || []).map((a: any) => a.name).join(',') || s.album || '',
-      cover_url: s.imgItems?.[s.imgItems.length - 1]?.img ? `https://d.musicapp.migu.cn${s.imgItems[s.imgItems.length - 1].img}` : undefined,
-      sourceId: s.contentId ? String(s.contentId) : undefined,
-      release_date: undefined,
-      genre: s.tagNames || '',
-      year: s.copyright ? String(s.copyright) : '',
-      track: s.songId || '',
-      score: 0,
-      source: 'migu',
-    }));
-  } catch {
-    return [];
-  }
+  const songs = body?.songResultData?.result || [];
+  return songs.map((s: any) => ({
+    artist: (s.singers || []).map((si: any) => si.name).join(',') || '',
+    title: s.name || '',
+    album: (s.albums || []).map((a: any) => a.name).join(',') || s.album || '',
+    cover_url: s.imgItems?.[s.imgItems.length - 1]?.img ? `https://d.musicapp.migu.cn${s.imgItems[s.imgItems.length - 1].img}` : undefined,
+    sourceId: s.contentId ? String(s.contentId) : undefined,
+    release_date: undefined,
+    genre: s.tagNames || '',
+    year: s.copyright ? String(s.copyright) : '',
+    track: s.songId || '',
+    score: 0,
+    source: 'migu',
+  }));
 }
 
 // ---- 酷我音乐（v2 API）----
 export async function searchKuWo(keyword: string): Promise<SearchResult[]> {
-  try {
-    const url = `https://kuwo.cn/search/searchMusicBykeyWord?vipver=1&client=kt&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&mobi=1&issubtitle=1&show_copyright_off=1&pn=0&rn=10&all=${encodeURIComponent(keyword)}`;
-    const rt = await fetchWithRetry(url, {
-      headers: {
-        'Referer': 'https://kuwo.cn/',
-        'User-Agent': 'Mozilla/5.0',
-      },
-    });
-    if (!rt.ok) return [];
-    const resp = rt.resp;
-    if (!resp.ok) return [];
+  const url = `https://kuwo.cn/search/searchMusicBykeyWord?vipver=1&client=kt&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&mobi=1&issubtitle=1&show_copyright_off=1&pn=0&rn=10&all=${encodeURIComponent(keyword)}`;
+  const resp = await fetchWithRetry(url, {
+    headers: {
+      'Referer': 'https://kuwo.cn/',
+      'User-Agent': 'Mozilla/5.0',
+    },
+  });
 
-    const data = await resp.json();
-    const songs = data?.abslist || [];
-    return songs.map((s: any) => ({
-      artist: s.ARTIST || '',
-      title: s.NAME || '',
-      album: s.ALBUM || '',
-      cover_url: s.hts_MVPIC || (s.web_albumpic_short ? `https://img1.kuwo.cn/star/albumcover/${s.web_albumpic_short}` : undefined),
-      sourceId: s.MUSICRID ? String(s.MUSICRID) : undefined,
-      release_date: undefined,
-      genre: s.GENRE || '',
-      year: s.YEAR || '',
-      track: s.track_number || '',
-      score: 0,
-      source: 'kuwo',
-    }));
-  } catch {
-    return [];
-  }
+  const data = await resp.json();
+  const songs = data?.abslist || [];
+  return songs.map((s: any) => ({
+    artist: s.ARTIST || '',
+    title: s.NAME || '',
+    album: s.ALBUM || '',
+    cover_url: s.hts_MVPIC || (s.web_albumpic_short ? `https://img1.kuwo.cn/star/albumcover/${s.web_albumpic_short}` : undefined),
+    sourceId: s.MUSICRID ? String(s.MUSICRID) : undefined,
+    release_date: undefined,
+    genre: s.GENRE || '',
+    year: s.YEAR || '',
+    track: s.track_number || '',
+    score: 0,
+    source: 'kuwo',
+  }));
 }
 
 // ============================================================
@@ -582,84 +548,6 @@ export function filterLyricsAds(lyrics: string): string {
   }
 
   return filtered.join('\n');
-}
-
-// ============================================================
-// .lrc 文件读取（同目录歌词文件）
-// ============================================================
-
-/**
- * 尝试从同目录读取 .lrc 歌词文件
- * 文件名匹配规则：与音频文件同名或同目录下任意 .lrc 文件
- * 安全：路径规范化后检查是否在音乐目录内
- */
-export async function fetchLrcFromLocal(filePath: string): Promise<string> {
-  if (!filePath) return '';
-
-  try {
-    // 构建 .lrc 文件路径（与音频文件同名）
-    const lrcPath = filePath.replace(/\.[^.]+$/, '.lrc');
-    // 安全检查：确保路径不包含路径遍历
-    if (lrcPath.includes('..')) {
-      songloft.log.warn(`[lrc] 路径遍历拒绝: ${lrcPath}`);
-      return '';
-    }
-    const token = await songloft.plugin.getToken();
-    const hostUrl = await songloft.plugin.getHostUrl();
-
-    // 尝试通过主机 API 读取 .lrc 文件
-    // 主机需要提供 GET /api/v1/files?path=... 端点
-    const resp = await fetch(`${hostUrl}/api/v1/files?path=${encodeURIComponent(lrcPath)}`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-
-    if (resp.ok) {
-      const content = await resp.text();
-      if (content && content.includes('[') && content.includes(':')) {
-        songloft.log.info(`[lrc] 读取本地歌词文件成功: ${lrcPath}`);
-        return content;
-      }
-    }
-
-    // 如果同名 .lrc 不存在，尝试读取目录下其他 .lrc 文件
-    const dirPath = lrcPath.substring(0, lrcPath.lastIndexOf('/'));
-    // 安全检查：确保目录路径不包含路径遍历
-    if (dirPath.includes('..')) {
-      songloft.log.warn(`[lrc] 路径遍历拒绝: ${dirPath}`);
-      return '';
-    }
-
-    const dirResp = await fetch(`${hostUrl}/api/v1/files?path=${encodeURIComponent(dirPath)}`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-
-    if (dirResp.ok) {
-      const files = await dirResp.json();
-      if (Array.isArray(files)) {
-        for (const f of files) {
-          if (typeof f === 'string' && f.endsWith('.lrc')) {
-            const otherLrcPath = `${dirPath}/${f}`;
-            // 安全检查：确保文件路径不包含路径遍历
-            if (otherLrcPath.includes('..')) continue;
-            const lrcResp = await fetch(`${hostUrl}/api/v1/files?path=${encodeURIComponent(otherLrcPath)}`, {
-              headers: { 'Authorization': `Bearer ${token}` },
-            });
-            if (lrcResp.ok) {
-              const content = await lrcResp.text();
-              if (content && content.includes('[') && content.includes(':')) {
-                songloft.log.info(`[lrc] 读取本地歌词文件成功: ${otherLrcPath}`);
-                return content;
-              }
-            }
-          }
-        }
-      }
-    }
-  } catch (e: any) {
-    songloft.log.warn(`[lrc] 读取本地歌词失败: ${e.message || e}`);
-  }
-
-  return '';
 }
 
 // ============================================================
@@ -794,8 +682,7 @@ export async function enrichFromChineseSources(
   artist: string,
   title: string,
   candidate: { artist: string; title: string },
-  cfg: ScraperConfig,
-  filePath?: string
+  cfg: ScraperConfig
 ): Promise<EnrichResult> {
   songloft.log.info(`[enrich] 开始 enrichment: ${artist} - ${title}`);
   const keyword = `${artist} ${title}`.trim();
@@ -803,14 +690,16 @@ export async function enrichFromChineseSources(
 
   const allResults: SearchResult[] = [];
 
-  // 并发去国内源搜索（与文本兜底一致的五源并发）
-  const tasks: Promise<SearchResult[]>[] = [];
-
+  // 并发去国内源搜索（与文本兜底一致的五源并发），统一走熔断器
   const searchWithScoring = async (fn: (kw: string, url: string) => Promise<SearchResult[]>, url: string, sourceName: string) => {
-    if (!url) return;
+    if (circuitIsOpen(sourceName)) {
+      songloft.log.info(`[enrich] ${sourceName} 熔断中，跳过`);
+      return;
+    }
     try {
       await rateLimitWait(sourceName);
       const results = await fn(keyword, url);
+      circuitSuccess(sourceName);
       for (const r of results) {
         r.score = scoreMatch(candidate, r);
       }
@@ -819,6 +708,7 @@ export async function enrichFromChineseSources(
       }
       allResults.push(...results);
     } catch (e: any) {
+      circuitFailure(sourceName);
       songloft.log.warn(`[enrich] ${sourceName} 搜索异常: ${e.message || e}`);
     }
   };
@@ -833,44 +723,12 @@ export async function enrichFromChineseSources(
   if (cfg.enable_kugou && cfg.kugou_api_url) {
     enrichTasks.push(searchWithScoring(searchKuGou, cfg.kugou_api_url, 'kugou'));
   }
-  // 咪咕（需签名）和酷我（无需配置项），按开关启用
+  // 咪咕和酷我无需 URL，按开关启用
   if (cfg.enable_migu) {
-    enrichTasks.push((async () => {
-      if (circuitIsOpen('migu')) {
-        songloft.log.info(`[enrich] migu 熔断中，跳过`);
-        return;
-      }
-      try {
-        await rateLimitWait('migu');
-        const results = await searchMiGu(keyword);
-        for (const r of results) { r.score = scoreMatch(candidate, r); }
-        if (results.length > 0) songloft.log.info(`[enrich] migu 返回 ${results.length} 条`);
-        allResults.push(...results);
-        circuitSuccess('migu');
-      } catch (e: any) {
-        circuitFailure('migu');
-        songloft.log.warn(`[enrich] migu 搜索异常: ${e.message || e}`);
-      }
-    })());
+    enrichTasks.push(searchWithScoring((kw, _url) => searchMiGu(kw), '-', 'migu'));
   }
   if (cfg.enable_kuwo) {
-    enrichTasks.push((async () => {
-      if (circuitIsOpen('kuwo')) {
-        songloft.log.info(`[enrich] kuwo 熔断中，跳过`);
-        return;
-      }
-      try {
-        await rateLimitWait('kuwo');
-        const results = await searchKuWo(keyword);
-        for (const r of results) { r.score = scoreMatch(candidate, r); }
-        if (results.length > 0) songloft.log.info(`[enrich] kuwo 返回 ${results.length} 条`);
-        allResults.push(...results);
-        circuitSuccess('kuwo');
-      } catch (e: any) {
-        circuitFailure('kuwo');
-        songloft.log.warn(`[enrich] kuwo 搜索异常: ${e.message || e}`);
-      }
-    })());
+    enrichTasks.push(searchWithScoring((kw, _url) => searchKuWo(kw), '-', 'kuwo'));
   }
 
   await Promise.allSettled(enrichTasks);
@@ -928,11 +786,6 @@ export async function enrichFromChineseSources(
         }
       } catch { /* ignore */ }
     }
-  }
-
-  // 本地 .lrc 文件兜底（在线歌词都失败时尝试）
-  if (!lyrics && filePath) {
-    lyrics = await fetchLrcFromLocal(filePath);
   }
 
   // 广告过滤
@@ -1029,16 +882,18 @@ function cleanFilenameNoise(s: string): string {
 const CONFIG_KEY = 'scraper_config';
 
 export async function loadConfig(): Promise<ScraperConfig> {
+  let cfg: ScraperConfig = { ...DEFAULT_CONFIG };
   try {
     const raw = await songloft.storage.get(CONFIG_KEY);
     if (raw && typeof raw === 'object') {
-      return { ...DEFAULT_CONFIG, ...raw };
-    }
-    if (raw && typeof raw === 'string') {
-      return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+      cfg = { ...DEFAULT_CONFIG, ...raw };
+    } else if (raw && typeof raw === 'string') {
+      cfg = { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
     }
   } catch { /* ignore */ }
-  return { ...DEFAULT_CONFIG };
+  // 所有刮削路径都经过 loadConfig，在此注入评分权重（唯一必经点）
+  setScoreWeights(cfg.title_weight, cfg.artist_weight);
+  return cfg;
 }
 export async function saveConfig(config: ScraperConfig): Promise<void> {
   await songloft.storage.set(CONFIG_KEY, JSON.stringify(config));
